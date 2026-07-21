@@ -12,9 +12,11 @@
 // Requires the app running with:  --remote-debugging-port=9238 --remote-allow-origins=*
 // (the `askgpt` bash wrapper handles launching it).
 //
-// Output is the assistant's raw GFM MARKDOWN, reassembled from the conversation WebSocket delta
-// stream (the app still runs — it maintains the session and passes Cloudflare/Sentinel for us —
-// but we read the network stream, not the DOM). Set ASKGPT_PLAIN=1 for rendered plain text.
+// Output is the assistant's raw GFM MARKDOWN, reassembled from the conversation delta stream (the
+// app still runs — it maintains the session and passes Cloudflare/Sentinel for us — but we read
+// the network stream, not the DOM). Two transports carry the same delta_encoding v1 SSE: a
+// WebSocket for normal models, and the /f/conversation POST response body for Pro; we capture
+// both. Set ASKGPT_PLAIN=1 for rendered plain text (DOM fallback).
 //
 // Usage:
 //   node askgpt.mjs "your question" [timeoutSec]   # ask (default cmd)
@@ -184,26 +186,32 @@ async function submitPrompt(c, prompt) {
   throw new Error('提交失败：消息未发出（composer 已填好但未产生 user 消息）');
 }
 
-// Reassemble the assistant's final-answer MARKDOWN from captured ChatGPT conversation WebSocket
-// frames. Content is delivered over a WS (not the /f/conversation POST, which only hands off):
-// each content frame is JSON nesting an `encoded_item` — an SSE blob of `event:`/`data:` lines in
-// the delta_encoding v1 protocol. We collect the string appends to the assistant TEXT message's
-// /content/parts/0. This yields the raw markdown (##, **, `code`, -, | tables) — unlike the DOM
+// Reassemble the assistant's final-answer MARKDOWN from the captured conversation stream, which
+// arrives over one of two transports carrying the SAME delta_encoding v1 SSE protocol:
+//   • normal models: a WebSocket, each frame JSON-nesting an `encoded_item` SSE blob;
+//   • Pro (pro_mode_turn_topic_streaming): the SSE streams directly as the /f/conversation POST
+//     response body (no WS, no encoded_item wrapper).
+// We normalise both into SSE `data:` lines, then collect the string appends to the assistant TEXT
+// message's /content/parts/0. Yields raw markdown (##, **, `code`, -, | tables) — unlike the DOM
 // whose innerText has all markers rendered away.
-function assembleMarkdown(frames) {
-  const datas = [];
-  for (const f of frames) {
+function assembleMarkdown(frames, fetchSse) {
+  const sseBlobs = [];
+  for (const f of frames) {                     // WS frames -> unwrap encoded_item SSE blobs
     let arr; try { arr = JSON.parse(f); } catch { continue; }
     for (const m of (Array.isArray(arr) ? arr : [arr])) {
       const ei = m?.payload?.payload?.encoded_item;
-      if (typeof ei !== 'string') continue;
-      for (const line of ei.split('\n')) {
-        const s = line.trim();
-        if (!s.startsWith('data:')) continue;
-        const body = s.slice(5).trim();
-        if (!body || body === '[DONE]' || body === '"v1"') continue;
-        try { datas.push(JSON.parse(body)); } catch {}
-      }
+      if (typeof ei === 'string') sseBlobs.push(ei);
+    }
+  }
+  if (fetchSse) sseBlobs.push(fetchSse);        // Pro / resume-SSE: response body is raw SSE already
+  const datas = [];
+  for (const blob of sseBlobs) {
+    for (const line of blob.split('\n')) {
+      const s = line.trim();
+      if (!s.startsWith('data:')) continue;
+      const body = s.slice(5).trim();
+      if (!body || body === '[DONE]' || body === '"v1"') continue;
+      try { datas.push(JSON.parse(body)); } catch {}
     }
   }
   const st = { buf: '', appending: false, haveFinal: false };
@@ -242,7 +250,7 @@ async function ask(prompt, timeoutSec = 300) {
   const c = client(t.webSocketDebuggerUrl); await c.ready;
   await c.send('Runtime.enable'); await c.send('Input.enable').catch(() => {});
   await c.send('Network.enable');
-  // capture the conversation content WebSocket frames; the stream ends with message_stream_complete
+  // Capture channel 1 — WebSocket frames (normal models). Stream ends with message_stream_complete.
   const frames = []; let streamDone = false, lastFrameAt = 0;
   c.on((method, params) => {
     if (method !== 'Network.webSocketFrameReceived') return;
@@ -254,24 +262,38 @@ async function ask(prompt, timeoutSec = 300) {
   await ensureModel(c, model, level);
   const baseMd = await evalOn(c, `document.querySelectorAll('.markdown, .prose').length`);
 
-  // DOM read — a backstop completion signal + the plain-text / parse-failure fallback. The answer
-  // prose is the LAST `.markdown` (NOT [data-message-author-role=assistant]: an empty assistant
-  // wrapper is the last such node). `streaming-animation` class = the turn is still being written.
-  const READ = `(()=>{const mds=[...document.querySelectorAll('.markdown, .prose')];
-    if(mds.length<=${baseMd})return {txt:'',streaming:!!document.querySelector('[data-testid=stop-button]'),fresh:false};
+  // Capture channel 2 — the /f/conversation (and resume /stream) fetch response body, which is
+  // where Pro streams its SSE directly. Tee the body into window.__ag_sse; window.__ag_done flips
+  // when the stream-complete marker arrives. (Idempotent wrap; buffers reset each turn.)
+  const HOOK = `(()=>{
+    if(!window.__agHook){window.__agHook=1;window.__ag_sse='';window.__ag_done=false;
+      const of=window.fetch;
+      window.fetch=async(...a)=>{const url=((a[0]&&a[0].url)||a[0])+'';const res=await of(...a);
+        try{if((url.indexOf('/f/conversation')>=0||url.indexOf('/stream')>=0)&&res.body){const cl=res.clone();const rd=cl.body.getReader();const dec=new TextDecoder();
+          (async()=>{try{for(;;){const r=await rd.read();if(r.done)break;const txt=dec.decode(r.value,{stream:true});window.__ag_sse+=txt;if(txt.indexOf('message_stream_complete')>=0)window.__ag_done=true;}}catch(e){}})();}}catch(e){}
+        return res;};}
+    window.__ag_sse='';window.__ag_done=false;return 'ok';})()`;
+
+  // DOM read — a backstop completion signal + the plain-text / parse-failure fallback. `done` folds
+  // in the fetch-SSE completion flag. The answer prose is the LAST `.markdown` (an empty assistant
+  // wrapper is the last [data-message-author-role=assistant] node); streaming-animation = writing.
+  const READ = `(()=>{const mds=[...document.querySelectorAll('.markdown, .prose')];const done=!!window.__ag_done;
+    if(mds.length<=${baseMd})return {txt:'',streaming:!!document.querySelector('[data-testid=stop-button]'),done,fresh:false};
     const md=mds[mds.length-1];const txt=md.innerText||'';
     const streaming=/streaming-animation|result-streaming/.test(md.className||'')||!!md.querySelector('.streaming-animation')||!!document.querySelector('[data-testid=stop-button]');
-    return {txt,streaming,fresh:true};})()`;
+    return {txt,streaming,done,fresh:true};})()`;
 
   frames.length = 0; streamDone = false; lastFrameAt = 0;   // ignore anything before our turn
+  await evalOn(c, HOOK);
   await submitPrompt(c, prompt);
 
   const deadline = Date.now() + timeoutSec * 1000;
   let last = '', prev = null, stable = 0, sawStreaming = false;
   while (Date.now() < deadline) {
-    if (streamDone) break;                        // primary: WS says the turn is complete
+    if (streamDone) break;                        // WS (normal models) says the turn is complete
     await sleep(700);
-    const st = await evalOn(c, READ);             // backstop via the DOM
+    const st = await evalOn(c, READ);
+    if (st.done) break;                           // fetch-SSE (Pro) says the turn is complete
     if (st.fresh && st.txt) last = st.txt;
     if (st.streaming) { sawStreaming = true; stable = 0; prev = st.txt; continue; }
     if (!sawStreaming) continue;
@@ -284,8 +306,9 @@ async function ask(prompt, timeoutSec = 300) {
   // wait out any trailing content frames (until the WS goes quiet ~1s or a short cap)
   for (let i = 0; i < 8 && Date.now() - lastFrameAt < 1000; i++) await sleep(300);
 
-  let out = plain ? '' : assembleMarkdown(frames);
-  if (!out) { const f = await evalOn(c, READ); out = (f.txt || last); } // plain mode, or WS parse empty
+  const fetchSse = await evalOn(c, `window.__ag_sse||''`);
+  let out = plain ? '' : assembleMarkdown(frames, fetchSse);
+  if (!out) { const f = await evalOn(c, READ); out = (f.txt || last); } // plain mode, or parse empty
   c.close();
   return out.trim();
 }
