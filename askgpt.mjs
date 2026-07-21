@@ -1,33 +1,28 @@
 #!/usr/bin/env node
-// askgpt.mjs — drive the ChatGPT desktop app (the current Codex-kernel build,
-// bundle id `com.openai.codex`) from your terminal via the Chrome DevTools
-// Protocol (CDP), asking a chosen model/reasoning level and printing the answer.
+// askgpt.mjs — drive the (Codex-kernel) ChatGPT desktop app's embedded chatgpt.com
+// via CDP, using your CHAT quota (regular models), bypassing the Codex #pricing gate.
 //
-// It uses your logged-in ChatGPT session (subscription quota), NOT any API key.
+// How it works:
+//   The app (bundle com.openai.codex) renders chat as a chatgpt.com <webview> that is
+//   forced to ?source=codex#pricing (Codex paywall) once Codex credits run out.
+//   We DON'T touch that webview. Instead we open a fresh top-level chatgpt.com page in
+//   the same Electron browser, copy the webview's auth cookies into it, and drive that
+//   clean page — it lands on normal chatgpt.com (no source=codex) = your chat quota.
 //
-// Why it is not trivial:
-//   The desktop app renders chat as an embedded chatgpt.com <webview>. Depending
-//   on account state that webview can get pushed to a "?source=codex#pricing"
-//   upsell route and refuses to leave it. Instead of fighting that webview, we
-//   open a *fresh* top-level chatgpt.com page in the same Electron browser and
-//   copy the webview's auth cookies into it — a clean page has no "source=codex"
-//   marker, so it lands on the normal chat UI.
+// Requires the app running with:  --remote-debugging-port=9238 --remote-allow-origins=*
+// (the `askgpt` bash wrapper handles launching it).
 //
-// Requires the app launched with:  --remote-debugging-port=9238 --remote-allow-origins=*
-// (the `askgpt` shell wrapper handles launching / relaunching it.)
-//
-// Requirements: macOS, Node >= 22 (uses global fetch + global WebSocket), and the
-// ChatGPT desktop app installed and signed in.
+// Output is the assistant's raw GFM MARKDOWN, reassembled from the conversation WebSocket delta
+// stream (the app still runs — it maintains the session and passes Cloudflare/Sentinel for us —
+// but we read the network stream, not the DOM). Set ASKGPT_PLAIN=1 for rendered plain text.
 //
 // Usage:
-//   node askgpt.mjs "your question" [timeoutSec]   # ask (default command)
+//   node askgpt.mjs "your question" [timeoutSec]   # ask (default cmd)
 //   node askgpt.mjs ask "..." [timeoutSec]
 //   node askgpt.mjs new                            # start a fresh conversation
 //   node askgpt.mjs setup                          # (re)create the clean logged-in page
 //   node askgpt.mjs status
-//
-// Env: ASKGPT_MODEL (default "GPT-5.6 Sol"), ASKGPT_LEVEL (default "Pro"),
-//      ASKGPT_PORT (default 9238).
+// Env: ASKGPT_MODEL, ASKGPT_LEVEL (reasoning tier), ASKGPT_PLAIN=1 (plain text instead of markdown)
 
 const PORT = process.env.ASKGPT_PORT || 9238;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -40,18 +35,17 @@ async function browserWs() {
   const r = await fetch(`${BASE}/json/version`);
   return (await r.json()).webSocketDebuggerUrl;
 }
-
-// Minimal CDP JSON-RPC client over a target's WebSocket.
 function client(wsUrl) {
   const ws = new WebSocket(wsUrl);
-  let id = 0; const pend = new Map();
+  let id = 0; const pend = new Map(); const handlers = [];
   const ready = new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.id && pend.has(m.id)) { const { resolve, reject } = pend.get(m.id); pend.delete(m.id); m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result); }
+    else if (m.method) { for (const h of handlers) h(m.method, m.params); }
   };
   const send = (method, params = {}) => new Promise((resolve, reject) => { const mid = ++id; pend.set(mid, { resolve, reject }); ws.send(JSON.stringify({ id: mid, method, params })); });
-  return { ready, send, close: () => ws.close() };
+  return { ready, send, on: (h) => handlers.push(h), close: () => ws.close() };
 }
 async function evalOn(c, expression) {
   const x = await c.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
@@ -81,7 +75,7 @@ async function findCleanLoggedInPage() {
 
 async function copyCookiesFromWebviewTo(pageTarget) {
   const wvT = await findWebview();
-  if (!wvT) throw new Error('No logged-in webview found (open the ChatGPT app and sign in first).');
+  if (!wvT) throw new Error('未找到已登录的 webview（请先在 ChatGPT app 里登录）');
   const wv = client(wvT.webSocketDebuggerUrl); await wv.ready; await wv.send('Network.enable');
   const { cookies } = await wv.send('Network.getAllCookies');
   wv.close();
@@ -100,27 +94,28 @@ async function createCleanPage() {
   const b = client(await browserWs()); await b.ready;
   const { targetId } = await b.send('Target.createTarget', { url: 'https://chatgpt.com/' });
   b.close();
+  // wait for it to appear with a ws url
   for (let i = 0; i < 30; i++) {
     const ts = await listTargets();
     const t = ts.find(x => x.id === targetId && x.webSocketDebuggerUrl);
     if (t) return t;
     await sleep(400);
   }
-  throw new Error('Timed out waiting for the new chatgpt.com page target.');
+  throw new Error('新建 chatgpt 页面 target 超时');
 }
 
-// Idempotent: reuse an existing clean logged-in page, else create one + inject cookies.
 async function ensureCleanPage() {
   let t = await findCleanLoggedInPage();
   if (t) return t;
   t = await createCleanPage();
   const st = await copyCookiesFromWebviewTo(t);
-  if (!st.loggedIn) throw new Error('Still not logged in after cookie copy: ' + JSON.stringify(st));
+  if (!st.loggedIn) throw new Error('cookie 复制后仍未登录：' + JSON.stringify(st));
+  // re-fetch the target (url changed)
   const ts = await listTargets();
   return ts.find(x => x.id === t.id) || t;
 }
 
-// ---- composer model / reasoning-level picker helpers ----
+// ---- composer model/level picker helpers ----
 async function clickXY(c, x, y) {
   await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }); await sleep(70);
   for (const type of ['mousePressed', 'mouseReleased']) await c.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
@@ -132,16 +127,14 @@ const menuOpen = c => evalOn(c, `!!document.querySelector('[data-testid=composer
 const cByRT = (role, text) => `(()=>{const els=[...document.querySelectorAll('[role=${role}]')].filter(m=>(m.textContent||'').replace(/\\s+/g,' ').trim()===${JSON.stringify(text)}&&m.getBoundingClientRect().width>0);const e=els[els.length-1];if(!e)return null;const r=e.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})()`;
 async function openMenu(c) { for (let i = 0; i < 4 && !(await menuOpen(c)); i++) { const s = await evalOn(c, SW_CENTER); if (s) await clickXY(c, s.x, s.y); await sleep(600); } return menuOpen(c); }
 
-// Ensure model family = `model` (submenu) and reasoning level = `level` (radio). Idempotent by label.
-// Note: the picker is driven by the labels the app renders. "GPT-5.6 Sol" and "Pro" are locale-independent;
-// other reasoning levels (Fast/Medium/High/... or their localized equivalents) use the app's displayed text.
+// ensure model family = `model` (submenu) and reasoning level = `level` (radio). Idempotent by label.
 async function ensureModel(c, model, level) {
   if ((await evalOn(c, SW_LABEL)) === level) return level; // level already set (model family persists per account)
   await pressEsc(c); await sleep(250);
   await openMenu(c);
   const parent = await evalOn(c, cByRT('menuitem', model));
   if (parent) {
-    await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: parent.x, y: parent.y }); await sleep(800); // hover opens the submenu
+    await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: parent.x, y: parent.y }); await sleep(800);
     const mo = await evalOn(c, cByRT('menuitemradio', model));
     if (mo) { await clickXY(c, mo.x, mo.y); await sleep(600); }
   }
@@ -153,41 +146,148 @@ async function ensureModel(c, model, level) {
   return await evalOn(c, SW_LABEL);
 }
 
-// Send by CLICKING the real send button. Pressing Enter alone only fires
-// /conversation/prepare (a prefetch) and does NOT submit the actual /conversation request.
-async function sendViaButton(c, prompt) {
-  await evalOn(c, `(()=>{const el=document.querySelector('#prompt-textarea');el&&el.focus();})()`); await sleep(150);
+async function pressKey(c, key, code, vk, modifiers = 0) {
+  for (const type of ['keyDown', 'keyUp']) await c.send('Input.dispatchKeyEvent', { type, key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+}
+// Enter submit MUST use rawKeyDown: a plain keyDown for Enter carries a char and the Lexical
+// editor swallows it as a newline / no-op; rawKeyDown fires the submit shortcut cleanly.
+async function submitEnter(c) {
+  await c.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+  await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+}
+async function clearComposer(c) {
+  await evalOn(c, `(()=>{const el=document.querySelector('#prompt-textarea');el&&el.focus();})()`); await sleep(120);
+  await pressKey(c, 'a', 'KeyA', 65, 4); // Cmd+A (Meta) select all
+  await sleep(100);
+  await pressKey(c, 'Delete', 'Delete', 46); await sleep(150);
+  return await evalOn(c, `(document.querySelector('#prompt-textarea')?.innerText||'').trim().length`);
+}
+const userCount = c => evalOn(c, `document.querySelectorAll('[data-message-author-role=user]').length`);
+// submit the prompt via ENTER (a synthesized send-button click does NOT trigger Lexical's submit).
+async function submitPrompt(c, prompt) {
+  await clearComposer(c);
+  await evalOn(c, `(()=>{const el=document.querySelector('#prompt-textarea');el&&el.focus();})()`); await sleep(120);
   await c.send('Input.insertText', { text: prompt }); await sleep(400);
   const typed = await evalOn(c, `(document.querySelector('#prompt-textarea')?.innerText||'').trim().length`);
-  if (!typed) throw new Error('Could not type the prompt into the composer.');
-  const sb = await evalOn(c, `(()=>{const b=[...document.querySelectorAll('button')].find(x=>/send-button|composer-submit/i.test(x.getAttribute('data-testid')||'')||/发送|Send/i.test(x.getAttribute('aria-label')||''));if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),disabled:!!b.disabled};})()`);
-  if (sb && !sb.disabled) await clickXY(c, sb.x, sb.y);
-  else for (const type of ['keyDown', 'keyUp']) await c.send('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+  if (!typed) throw new Error('无法把问题填进输入框');
+  const before = await userCount(c);
+  // On a fresh page neither a synthesized Enter nor a coordinate mouse-click reliably submits;
+  // invoking the send button's own .click() handler via JS does. Retry (button may briefly
+  // disable right after typing), with a raw-Enter fallback each round.
+  const clickSend = `(()=>{const b=document.querySelector('[data-testid=send-button]')||[...document.querySelectorAll('button')].find(x=>/发送|Send/i.test(x.getAttribute('aria-label')||''));if(!b)return 'nobtn';if(b.disabled)return 'disabled';b.click();return 'ok';})()`;
+  for (let i = 0; i < 5; i++) {
+    await evalOn(c, clickSend); await sleep(900);
+    if ((await userCount(c)) > before) return; // submitted
+    await submitEnter(c); await sleep(700);
+    if ((await userCount(c)) > before) return;
+  }
+  throw new Error('提交失败：消息未发出（composer 已填好但未产生 user 消息）');
+}
+
+// Reassemble the assistant's final-answer MARKDOWN from captured ChatGPT conversation WebSocket
+// frames. Content is delivered over a WS (not the /f/conversation POST, which only hands off):
+// each content frame is JSON nesting an `encoded_item` — an SSE blob of `event:`/`data:` lines in
+// the delta_encoding v1 protocol. We collect the string appends to the assistant TEXT message's
+// /content/parts/0. This yields the raw markdown (##, **, `code`, -, | tables) — unlike the DOM
+// whose innerText has all markers rendered away.
+function assembleMarkdown(frames) {
+  const datas = [];
+  for (const f of frames) {
+    let arr; try { arr = JSON.parse(f); } catch { continue; }
+    for (const m of (Array.isArray(arr) ? arr : [arr])) {
+      const ei = m?.payload?.payload?.encoded_item;
+      if (typeof ei !== 'string') continue;
+      for (const line of ei.split('\n')) {
+        const s = line.trim();
+        if (!s.startsWith('data:')) continue;
+        const body = s.slice(5).trim();
+        if (!body || body === '[DONE]' || body === '"v1"') continue;
+        try { datas.push(JSON.parse(body)); } catch {}
+      }
+    }
+  }
+  const st = { buf: '', appending: false, haveFinal: false };
+  // apply one op to the accumulator. `append` to /content/parts/ (or a bare continuation) grows
+  // the answer text; everything else (status/metadata replaces) is ignored.
+  const applyOp = (op) => {
+    if (!op) return;
+    if (op.o === 'append' && typeof op.v === 'string') {
+      if (typeof op.p === 'string' && op.p.includes('/content/parts/')) st.appending = st.haveFinal;
+      if (st.appending) st.buf += op.v;
+    } else if (op.o == null && !('p' in op) && typeof op.v === 'string') { // bare continuation append
+      if (st.appending) st.buf += op.v;
+    }
+  };
+  for (const d of datas) {
+    if (d && d.v && typeof d.v === 'object' && !Array.isArray(d.v) && d.v.message) { // a message was added
+      const msg = d.v.message;
+      if (msg.author?.role === 'assistant' && msg.content?.content_type === 'text') {
+        st.haveFinal = true; st.appending = true;
+        st.buf = (msg.content.parts && typeof msg.content.parts[0] === 'string') ? msg.content.parts[0] : '';
+      } else { st.appending = false; }                                   // system/reasoning/user msg
+    } else if (d && d.o === 'patch' && Array.isArray(d.v)) {             // batched sub-ops (tail content
+      for (const sub of d.v) applyOp(sub);                               //   arrives inside a patch!)
+    } else {
+      applyOp(d);
+    }
+  }
+  return st.buf.trim();
 }
 
 async function ask(prompt, timeoutSec = 300) {
   const model = process.env.ASKGPT_MODEL || 'GPT-5.6 Sol';
   const level = process.env.ASKGPT_LEVEL || 'Pro';
+  const plain = process.env.ASKGPT_PLAIN === '1' || process.env.ASKGPT_PLAIN === 'true';
   const t = await ensureCleanPage();
   const c = client(t.webSocketDebuggerUrl); await c.ready;
   await c.send('Runtime.enable'); await c.send('Input.enable').catch(() => {});
+  await c.send('Network.enable');
+  // capture the conversation content WebSocket frames; the stream ends with message_stream_complete
+  const frames = []; let streamDone = false, lastFrameAt = 0;
+  c.on((method, params) => {
+    if (method !== 'Network.webSocketFrameReceived') return;
+    const d = params?.response?.payloadData;
+    if (typeof d !== 'string') return;
+    frames.push(d); lastFrameAt = Date.now();
+    if (d.includes('message_stream_complete') || d.includes('"is_complete": true')) streamDone = true;
+  });
   await ensureModel(c, model, level);
-  await sendViaButton(c, prompt);
+  const baseMd = await evalOn(c, `document.querySelectorAll('.markdown, .prose').length`);
 
-  // "generating" signal = a Stop button in the composer (matched across locales).
-  const READ = `(()=>{const as=document.querySelectorAll('[data-message-author-role=assistant]');const a=as.length?as[as.length-1]:null;const txt=a?a.textContent:'';const streaming=!!document.querySelector('button[aria-label*="Stop" i],button[aria-label*="停止"]');return {txt,streaming};})()`;
-  const FINAL = `(()=>{const as=document.querySelectorAll('[data-message-author-role=assistant]');const a=as[as.length-1];return a?a.textContent:'';})()`;
+  // DOM read — a backstop completion signal + the plain-text / parse-failure fallback. The answer
+  // prose is the LAST `.markdown` (NOT [data-message-author-role=assistant]: an empty assistant
+  // wrapper is the last such node). `streaming-animation` class = the turn is still being written.
+  const READ = `(()=>{const mds=[...document.querySelectorAll('.markdown, .prose')];
+    if(mds.length<=${baseMd})return {txt:'',streaming:!!document.querySelector('[data-testid=stop-button]'),fresh:false};
+    const md=mds[mds.length-1];const txt=md.innerText||'';
+    const streaming=/streaming-animation|result-streaming/.test(md.className||'')||!!md.querySelector('.streaming-animation')||!!document.querySelector('[data-testid=stop-button]');
+    return {txt,streaming,fresh:true};})()`;
+
+  frames.length = 0; streamDone = false; lastFrameAt = 0;   // ignore anything before our turn
+  await submitPrompt(c, prompt);
+
   const deadline = Date.now() + timeoutSec * 1000;
-  let last = '', stable = 0, started = false;
+  let last = '', prev = null, stable = 0, sawStreaming = false;
   while (Date.now() < deadline) {
-    await sleep(2000);
-    const st = await evalOn(c, READ);
-    if (st.streaming) { started = true; last = st.txt; stable = 0; continue; }
-    if (started) { await sleep(800); last = await evalOn(c, FINAL); break; } // streaming ended
-    if (st.txt && st.txt.length > 0) { if (st.txt === last) { stable++; if (stable >= 3) break; } else { stable = 0; last = st.txt; } } // fast/instant answers
+    if (streamDone) break;                        // primary: WS says the turn is complete
+    await sleep(700);
+    const st = await evalOn(c, READ);             // backstop via the DOM
+    if (st.fresh && st.txt) last = st.txt;
+    if (st.streaming) { sawStreaming = true; stable = 0; prev = st.txt; continue; }
+    if (!sawStreaming) continue;
+    // DOM-stable backstop, but only fire once the WS has been quiet ≥2s (no content frame
+    // mid-flight) so we never assemble a half-streamed answer.
+    const wsQuiet = Date.now() - lastFrameAt > 2000;
+    if (st.fresh && st.txt && st.txt === prev && wsQuiet) { if (++stable >= 3) break; } else stable = 0;
+    prev = st.fresh ? st.txt : prev;
   }
+  // wait out any trailing content frames (until the WS goes quiet ~1s or a short cap)
+  for (let i = 0; i < 8 && Date.now() - lastFrameAt < 1000; i++) await sleep(300);
+
+  let out = plain ? '' : assembleMarkdown(frames);
+  if (!out) { const f = await evalOn(c, READ); out = (f.txt || last); } // plain mode, or WS parse empty
   c.close();
-  return last;
+  return out.trim();
 }
 
 async function newChat() {
@@ -213,9 +313,9 @@ async function main() {
     } else {
       const prompt = argv[0];
       const timeout = parseInt(argv[1] || '300', 10);
-      if (!prompt) { console.error('usage: askgpt "your question" [timeoutSec]  (default model GPT-5.6 Sol + Pro; override via ASKGPT_MODEL / ASKGPT_LEVEL)'); process.exit(1); }
+      if (!prompt) { console.error('usage: askgpt "your question" [timeoutSec]  (default GPT-5.6 Sol + Pro, output is markdown; ASKGPT_MODEL/ASKGPT_LEVEL to override the model, ASKGPT_PLAIN=1 for plain text)'); process.exit(1); }
       const ans = await ask(prompt, timeout);
-      process.stdout.write((ans || '(empty / timed out)') + '\n');
+      process.stdout.write((ans || '(空 / 超时)') + '\n');
     }
   } catch (e) {
     console.error('ERROR:', String(e.message || e));
