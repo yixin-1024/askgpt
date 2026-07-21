@@ -1,0 +1,36 @@
+#!/bin/bash
+# askgpt — ask your ChatGPT desktop app (the Codex-kernel build, bundle
+# com.openai.codex) a question from the terminal, using your ChatGPT subscription.
+#
+# This wrapper is self-healing: it ensures the app is running with the CDP debug
+# port enabled, then drives a clean logged-in chatgpt.com page inside it.
+#
+# Usage:
+#   askgpt "your question"        # ask (default 300s timeout)
+#   askgpt "your question" 600    # custom timeout in seconds
+#   askgpt new                    # start a fresh conversation
+#   askgpt setup                  # (re)create the clean logged-in page
+#   askgpt status
+set -euo pipefail
+PORT="${ASKGPT_PORT:-9238}"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUNDLE="${ASKGPT_BUNDLE:-com.openai.codex}"
+
+cdp_up() { curl -s --max-time 3 "http://127.0.0.1:${PORT}/json/version" >/dev/null 2>&1; }
+
+if ! cdp_up; then
+  echo "[askgpt] CDP not up on :${PORT} — (re)launching the ChatGPT app with the debug port..." >&2
+  osascript -e "quit app id \"${BUNDLE}\"" >/dev/null 2>&1 || true
+  sleep 2
+  open -b "${BUNDLE}" --args --remote-debugging-port="${PORT}" --remote-allow-origins='*' >/dev/null 2>&1
+  # wait up to ~25s for CDP + the webview to load chatgpt.com (so auth cookies exist)
+  for i in $(seq 1 25); do
+    if cdp_up && curl -s --max-time 3 "http://127.0.0.1:${PORT}/json/list" | grep -q 'chatgpt.com'; then
+      break
+    fi
+    sleep 1
+  done
+  sleep 2
+fi
+
+exec node "${DIR}/askgpt.mjs" "$@"
