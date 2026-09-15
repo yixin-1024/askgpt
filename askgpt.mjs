@@ -57,6 +57,12 @@ async function evalOn(c, expression) {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const CHECK_LOGIN = `(()=>({loggedIn:!!document.querySelector('[data-testid="accounts-profile-button"]'),composer:!!document.querySelector('#prompt-textarea,div[contenteditable="true"]'),href:location.href,pricing:!!document.querySelector('[data-testid*="pricing-modal"],[data-testid*="select-plan"]')}))()`;
+// Default to a *temporary chat* (not saved to history / not used for training). The query param
+// survives sending messages — the "临时聊天" H1 and its close button do not — so the URL is the
+// only reliable "am I still in a temp chat" signal. ASKGPT_TEMP=0 opts back into normal chats.
+const TEMP_CHAT = !['0', 'false', 'no'].includes((process.env.ASKGPT_TEMP || '1').toLowerCase());
+const CHAT_URL = TEMP_CHAT ? 'https://chatgpt.com/?temporary-chat=true' : 'https://chatgpt.com/';
+const isTempChat = (href) => /[?&]temporary-chat=true/.test(href || '');
 
 async function findWebview() {
   const ts = await listTargets();
@@ -86,7 +92,7 @@ async function copyCookiesFromWebviewTo(pageTarget) {
   const pg = client(pageTarget.webSocketDebuggerUrl); await pg.ready;
   await pg.send('Network.enable'); await pg.send('Page.enable');
   await pg.send('Network.setCookies', { cookies: toSet });
-  await pg.send('Page.navigate', { url: 'https://chatgpt.com/' });
+  await pg.send('Page.navigate', { url: CHAT_URL });
   await sleep(6000);
   const st = await evalOn(pg, CHECK_LOGIN); pg.close();
   return st;
@@ -94,7 +100,7 @@ async function copyCookiesFromWebviewTo(pageTarget) {
 
 async function createCleanPage() {
   const b = client(await browserWs()); await b.ready;
-  const { targetId } = await b.send('Target.createTarget', { url: 'https://chatgpt.com/' });
+  const { targetId } = await b.send('Target.createTarget', { url: CHAT_URL });
   b.close();
   // wait for it to appear with a ws url
   for (let i = 0; i < 30; i++) {
@@ -106,15 +112,41 @@ async function createCleanPage() {
   throw new Error('新建 chatgpt 页面 target 超时');
 }
 
+// If the reusable page isn't in a temporary chat, navigate it there (rather than spawning yet
+// another target). A page already sitting in a temp chat is left alone, so follow-up questions
+// keep their context.
+async function ensureTemporary(t) {
+  if (!TEMP_CHAT) return t;
+  const c = client(t.webSocketDebuggerUrl); await c.ready;
+  await c.send('Runtime.enable'); await c.send('Page.enable');
+  if (isTempChat(await evalOn(c, `location.href`))) { c.close(); return t; }
+  await c.send('Page.navigate', { url: CHAT_URL });
+  // Wait for the NEW document, never the outgoing one: the old page keeps its #prompt-textarea
+  // for a moment, and returning early let the navigation land in the middle of typing — ChatGPT
+  // then restored its saved draft and submitted THAT, so we silently answered the previous
+  // question. Require the temp-chat href + a finished document + a composer.
+  let ok = false;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const st = await evalOn(c, `(()=>({href:location.href,ready:document.readyState,composer:!!document.querySelector('#prompt-textarea')}))()`).catch(() => null);
+    if (st && isTempChat(st.href) && st.ready === 'complete' && st.composer) { ok = true; break; }
+  }
+  await sleep(1200);   // let the SPA settle (draft restore, composer hydration)
+  c.close();
+  if (!ok) throw new Error('切换到临时聊天失败（UI 可能又变了；ASKGPT_TEMP=0 可回普通会话）');
+  const ts = await listTargets();
+  return ts.find(x => x.id === t.id) || t;
+}
+
 async function ensureCleanPage() {
   let t = await findCleanLoggedInPage();
-  if (t) return t;
+  if (t) return await ensureTemporary(t);
   t = await createCleanPage();
   const st = await copyCookiesFromWebviewTo(t);
   if (!st.loggedIn) throw new Error('cookie 复制后仍未登录：' + JSON.stringify(st));
   // re-fetch the target (url changed)
   const ts = await listTargets();
-  return ts.find(x => x.id === t.id) || t;
+  return await ensureTemporary(ts.find(x => x.id === t.id) || t);
 }
 
 // ---- composer model/level picker helpers ----
@@ -123,27 +155,54 @@ async function clickXY(c, x, y) {
   for (const type of ['mousePressed', 'mouseReleased']) await c.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
 }
 async function pressEsc(c) { for (const type of ['keyDown', 'keyUp']) await c.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 }); }
-const SW_LABEL = `(()=>{const ta=document.querySelector('#prompt-textarea');const f=ta&&ta.closest('form')||document;const b=[...f.querySelectorAll('button[aria-haspopup=menu]')][0];return b?(b.textContent||'').replace(/\\s+/g,' ').trim():'';})()`;
-const SW_CENTER = `(()=>{const ta=document.querySelector('#prompt-textarea');const f=ta&&ta.closest('form')||document;const b=[...f.querySelectorAll('button[aria-haspopup=menu]')][0];if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})()`;
+// The intelligence picker trigger is the composer's `aria-haspopup=menu` button that is NOT the
+// "+" attachment button — as of 2026-09 the plus button sorts first, so indexing [0] grabs the
+// wrong one (it opens the attachment menu, and every model/level click silently no-ops).
+const PICKER_BTN = `[...((document.querySelector('#prompt-textarea')||{}).closest?.('form')||document).querySelectorAll('button[aria-haspopup=menu]')].filter(x=>x.getAttribute('data-testid')!=='composer-plus-btn'&&x.getBoundingClientRect().width>0)[0]`;
+const SW_LABEL = `(()=>{const b=${PICKER_BTN};return b?(b.textContent||'').replace(/\\s+/g,' ').trim():'';})()`;
+const SW_CENTER = `(()=>{const b=${PICKER_BTN};if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})()`;
+// Reasoning level is a 5-stop radix slider (aria-valuenow 0..4) driven by arrow keys, not a
+// submenu of radios. Index → label, plus the aliases older callers/docs used.
+const TIERS = ['即时', '中', '高', '极高', 'Pro'];
+const TIER_ALIAS = { '极速': '即时', '快速': '即时', 'instant': '即时', 'pro': 'Pro', 'PRO': 'Pro', '6Pro': 'Pro' };
+const tierIndex = (level) => TIERS.indexOf(TIER_ALIAS[level] || level);
+const SLIDER_NOW = `(()=>{const s=document.querySelector('[role=slider]');const v=s&&s.getAttribute('aria-valuenow');return v==null?null:Number(v)})()`;
+const SLIDER_FOCUS = `(()=>{const s=document.querySelector('[role=slider]');if(!s)return false;s.focus();return document.activeElement===s})()`;
+const CHECKED_MODEL = `(()=>{const e=[...document.querySelectorAll('[role=menuitemradio]')].find(x=>x.getAttribute('aria-checked')==='true');return e?(e.textContent||'').replace(/\\s+/g,' ').trim():null})()`;
 const menuOpen = c => evalOn(c, `!!document.querySelector('[data-testid=composer-intelligence-picker-content]')`);
 const cByRT = (role, text) => `(()=>{const els=[...document.querySelectorAll('[role=${role}]')].filter(m=>(m.textContent||'').replace(/\\s+/g,' ').trim()===${JSON.stringify(text)}&&m.getBoundingClientRect().width>0);const e=els[els.length-1];if(!e)return null;const r=e.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})()`;
 async function openMenu(c) { for (let i = 0; i < 4 && !(await menuOpen(c)); i++) { const s = await evalOn(c, SW_CENTER); if (s) await clickXY(c, s.x, s.y); await sleep(600); } return menuOpen(c); }
 
-// ensure model family = `model` (submenu) and reasoning level = `level` (radio). Idempotent by label.
+// ensure model family = `model` (a top-level radio) and reasoning level = `level` (the slider).
+// Picking a model radio closes the picker, so the level pass reopens it.
 async function ensureModel(c, model, level) {
-  if ((await evalOn(c, SW_LABEL)) === level) return level; // level already set (model family persists per account)
+  const want = tierIndex(level);
   await pressEsc(c); await sleep(250);
-  await openMenu(c);
-  const parent = await evalOn(c, cByRT('menuitem', model));
-  if (parent) {
-    await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: parent.x, y: parent.y }); await sleep(800);
+  if (!(await openMenu(c))) { console.error('[askgpt] 打不开模型/强度选择器，沿用页面当前档位'); return await evalOn(c, SW_LABEL); }
+
+  if (model && (await evalOn(c, CHECKED_MODEL)) !== model) {
     const mo = await evalOn(c, cByRT('menuitemradio', model));
-    if (mo) { await clickXY(c, mo.x, mo.y); await sleep(600); }
+    if (mo) { await clickXY(c, mo.x, mo.y); await sleep(700); }  // closes the picker
+    else console.error(`[askgpt] 选择器里找不到模型「${model}」，沿用当前模型`);
   }
-  await pressEsc(c); await sleep(250);
-  await openMenu(c);
-  const lv = await evalOn(c, cByRT('menuitemradio', level));
-  if (lv) { await clickXY(c, lv.x, lv.y); await sleep(600); }
+
+  if (want >= 0) {
+    if (!(await menuOpen(c)) && !(await openMenu(c))) { console.error('[askgpt] 重开选择器失败，跳过强度设置'); return await evalOn(c, SW_LABEL); }
+    let now = await evalOn(c, SLIDER_NOW);
+    if (now == null) console.error('[askgpt] 找不到强度滑块（UI 可能又变了），跳过强度设置');
+    else if (await evalOn(c, SLIDER_FOCUS)) {
+      for (let guard = 0; guard < TIERS.length + 2 && now !== want; guard++) {
+        const right = want > now;
+        await pressKey(c, right ? 'ArrowRight' : 'ArrowLeft', right ? 'ArrowRight' : 'ArrowLeft', right ? 39 : 37);
+        await sleep(280);
+        const next = await evalOn(c, SLIDER_NOW);
+        if (next === now) break;   // slider refused to move (clamped / detached)
+        now = next;
+      }
+      if (now !== want) console.error(`[askgpt] 强度停在「${TIERS[now] ?? now}」，目标是「${TIERS[want]}」`);
+    }
+  } else if (level) console.error(`[askgpt] 未知强度档「${level}」（可选 ${TIERS.join('/')}），沿用当前档位`);
+
   await pressEsc(c); await sleep(350);
   return await evalOn(c, SW_LABEL);
 }
@@ -165,6 +224,19 @@ async function clearComposer(c) {
   return await evalOn(c, `(document.querySelector('#prompt-textarea')?.innerText||'').trim().length`);
 }
 const userCount = c => evalOn(c, `document.querySelectorAll('[data-message-author-role=user]').length`);
+const LAST_USER_TEXT = `(()=>{const l=[...document.querySelectorAll('[data-message-author-role=user]')].pop();return l?(l.innerText||'').replace(/\\s+/g,''):''})()`;
+// A bumped user-message count only proves *something* got sent. Confirm the turn that went out is
+// OUR prompt — otherwise (mid-flight navigation, restored draft) we'd scrape the previous answer
+// and hand it back as if it were fresh.
+async function verifyEcho(c, prompt) {
+  const want = prompt.replace(/\s+/g, '').slice(0, 24);
+  if (!want) return;
+  for (let i = 0; i < 6; i++) {
+    if (((await evalOn(c, LAST_USER_TEXT)) || '').includes(want)) return;
+    await sleep(400);
+  }
+  throw new Error('发出的消息不是本次的问题（页面可能中途跳转或恢复了旧草稿），请重跑');
+}
 // submit the prompt via ENTER (a synthesized send-button click does NOT trigger Lexical's submit).
 async function submitPrompt(c, prompt) {
   await clearComposer(c);
@@ -179,9 +251,9 @@ async function submitPrompt(c, prompt) {
   const clickSend = `(()=>{const b=document.querySelector('[data-testid=send-button]')||[...document.querySelectorAll('button')].find(x=>/发送|Send/i.test(x.getAttribute('aria-label')||''));if(!b)return 'nobtn';if(b.disabled)return 'disabled';b.click();return 'ok';})()`;
   for (let i = 0; i < 5; i++) {
     await evalOn(c, clickSend); await sleep(900);
-    if ((await userCount(c)) > before) return; // submitted
+    if ((await userCount(c)) > before) return await verifyEcho(c, prompt); // submitted
     await submitEnter(c); await sleep(700);
-    if ((await userCount(c)) > before) return;
+    if ((await userCount(c)) > before) return await verifyEcho(c, prompt);
   }
   throw new Error('提交失败：消息未发出（composer 已填好但未产生 user 消息）');
 }
@@ -243,7 +315,7 @@ function assembleMarkdown(frames, fetchSse) {
 }
 
 async function ask(prompt, timeoutSec = 300) {
-  const model = process.env.ASKGPT_MODEL || 'GPT-5.6 Sol';
+  const model = process.env.ASKGPT_MODEL || '最新';
   const level = process.env.ASKGPT_LEVEL || 'Pro';
   const plain = process.env.ASKGPT_PLAIN === '1' || process.env.ASKGPT_PLAIN === 'true';
   const t = await ensureCleanPage();
@@ -259,8 +331,13 @@ async function ask(prompt, timeoutSec = 300) {
     frames.push(d); lastFrameAt = Date.now();
     if (d.includes('message_stream_complete') || d.includes('"is_complete": true')) streamDone = true;
   });
-  await ensureModel(c, model, level);
-  const baseMd = await evalOn(c, `document.querySelectorAll('.markdown, .prose').length`);
+  const tier = await ensureModel(c, model, level);
+  console.error(`[askgpt] 强度档=${tier || '未知'}（目标 ${model} / ${level}）`);
+  const A_SEL = '[data-message-author-role=assistant] .markdown, [data-message-author-role=assistant] .prose';
+  // Scope to ASSISTANT turns only: since a 2026-09 UI change the *user* bubble also carries
+  // `markdown prose`, so "the last .markdown on the page" was our own question — on a Pro turn
+  // that hasn't produced text yet, that got returned as if it were the answer.
+  const baseMd = await evalOn(c, `document.querySelectorAll('${A_SEL}').length`);
 
   // Capture channel 2 — the /f/conversation (and resume /stream) fetch response body, which is
   // where Pro streams its SSE directly. Tee the body into window.__ag_sse; window.__ag_done flips
@@ -277,7 +354,7 @@ async function ask(prompt, timeoutSec = 300) {
   // DOM read — a backstop completion signal + the plain-text / parse-failure fallback. `done` folds
   // in the fetch-SSE completion flag. The answer prose is the LAST `.markdown` (an empty assistant
   // wrapper is the last [data-message-author-role=assistant] node); streaming-animation = writing.
-  const READ = `(()=>{const mds=[...document.querySelectorAll('.markdown, .prose')];const done=!!window.__ag_done;
+  const READ = `(()=>{const mds=[...document.querySelectorAll('${A_SEL}')];const done=!!window.__ag_done;
     if(mds.length<=${baseMd})return {txt:'',streaming:!!document.querySelector('[data-testid=stop-button]'),done,fresh:false};
     const md=mds[mds.length-1];const txt=md.innerText||'';
     const streaming=/streaming-animation|result-streaming/.test(md.className||'')||!!md.querySelector('.streaming-animation')||!!document.querySelector('[data-testid=stop-button]');
@@ -288,19 +365,19 @@ async function ask(prompt, timeoutSec = 300) {
   await submitPrompt(c, prompt);
 
   const deadline = Date.now() + timeoutSec * 1000;
-  let last = '', prev = null, stable = 0, sawStreaming = false;
+  let last = '', prev = null, stable = 0, sawStreaming = false, finished = false;
   while (Date.now() < deadline) {
-    if (streamDone) break;                        // WS (normal models) says the turn is complete
+    if (streamDone) { finished = true; break; }   // WS (normal models) says the turn is complete
     await sleep(700);
     const st = await evalOn(c, READ);
-    if (st.done) break;                           // fetch-SSE (Pro) says the turn is complete
+    if (st.done) { finished = true; break; }      // fetch-SSE (Pro) says the turn is complete
     if (st.fresh && st.txt) last = st.txt;
     if (st.streaming) { sawStreaming = true; stable = 0; prev = st.txt; continue; }
     if (!sawStreaming) continue;
     // DOM-stable backstop, but only fire once the WS has been quiet ≥2s (no content frame
     // mid-flight) so we never assemble a half-streamed answer.
     const wsQuiet = Date.now() - lastFrameAt > 2000;
-    if (st.fresh && st.txt && st.txt === prev && wsQuiet) { if (++stable >= 3) break; } else stable = 0;
+    if (st.fresh && st.txt && st.txt === prev && wsQuiet) { if (++stable >= 3) { finished = true; break; } } else stable = 0;
     prev = st.fresh ? st.txt : prev;
   }
   // wait out any trailing content frames (until the WS goes quiet ~1s or a short cap)
@@ -310,13 +387,30 @@ async function ask(prompt, timeoutSec = 300) {
   let out = plain ? '' : assembleMarkdown(frames, fetchSse);
   if (!out) { const f = await evalOn(c, READ); out = (f.txt || last); } // plain mode, or parse empty
   c.close();
-  return out.trim();
+  out = out.trim();
+  // Fail loudly. A Pro turn can think for >10min with no assistant node on the page yet; returning
+  // whatever text happened to be around (or an empty string) would silently pass off a non-answer
+  // as the answer. The turn keeps running in the app — just re-ask with a bigger timeout.
+  if (!out) throw new Error(finished
+    ? '本轮结束但没抓到回答正文（页面结构可能又变了，用 ASKGPT_PLAIN=1 对比看看）'
+    : `等待 ${timeoutSec}s 超时，回答还没写出来（Pro 档深度思考经常 >10min）——加大超时重试：askgpt "..." 900`);
+  // A timed-out turn is NOT a success: a truncated answer on stdout with exit 0 looks exactly like
+  // a complete one to whatever consumes it. Fail by default and carry the partial text inside the
+  // error (so nothing is lost); callers that genuinely want the fragment opt in with ASKGPT_PARTIAL=1.
+  if (!finished) {
+    if (!['1', 'true', 'yes'].includes((process.env.ASKGPT_PARTIAL || '').toLowerCase())) {
+      const e = new Error(`等待 ${timeoutSec}s 超时，回答只写了一半（${out.length} 字）——加大超时重试，或 ASKGPT_PARTIAL=1 接受残文\n--- 截至超时的部分正文 ---\n${out}`);
+      e.partialText = out; throw e;
+    }
+    console.error(`[askgpt] ⚠️ 超时 ${timeoutSec}s，下面是截至超时已写出的部分，不完整`);
+  }
+  return out;
 }
 
 async function newChat() {
   const t = await ensureCleanPage();
   const c = client(t.webSocketDebuggerUrl); await c.ready; await c.send('Page.enable');
-  await c.send('Page.navigate', { url: 'https://chatgpt.com/' });
+  await c.send('Page.navigate', { url: CHAT_URL });
   await sleep(3000); c.close();
   return 'new chat ready';
 }
@@ -328,7 +422,7 @@ async function main() {
   try {
     if (cmd === 'status') {
       const wv = await findWebview(); const pg = await findCleanLoggedInPage();
-      console.log(JSON.stringify({ cdp: true, webviewLoggedInSession: !!wv, cleanPageReady: !!pg }, null, 2));
+      console.log(JSON.stringify({ cdp: true, webviewLoggedInSession: !!wv, cleanPageReady: !!pg, temporaryChatWanted: TEMP_CHAT, pageIsTemporaryChat: isTempChat(pg && pg.url) }, null, 2));
     } else if (cmd === 'setup') {
       const t = await ensureCleanPage(); console.log('setup OK, clean page:', t.url);
     } else if (cmd === 'new') {
@@ -336,7 +430,7 @@ async function main() {
     } else {
       const prompt = argv[0];
       const timeout = parseInt(argv[1] || '300', 10);
-      if (!prompt) { console.error('usage: askgpt "your question" [timeoutSec]  (default GPT-5.6 Sol + Pro, output is markdown; ASKGPT_MODEL/ASKGPT_LEVEL to override the model, ASKGPT_PLAIN=1 for plain text)'); process.exit(1); }
+      if (!prompt) { console.error('usage: askgpt "your question" [timeoutSec]  (defaults to the "latest" model + Pro tier in a temporary chat, output is markdown; ASKGPT_MODEL/ASKGPT_LEVEL to override the model, ASKGPT_TEMP=0 for a normal chat, ASKGPT_PLAIN=1 for plain text)'); process.exit(1); }
       const ans = await ask(prompt, timeout);
       process.stdout.write((ans || '(空 / 超时)') + '\n');
     }
